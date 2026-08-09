@@ -1,0 +1,740 @@
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useCallback,
+} from "react";
+import { getExercise } from "../data/exercises";
+import { supabase } from "../lib/supabase";
+
+const AppContext = createContext(null);
+
+/* ---------- helpers ---------- */
+
+// Local calendar day (YYYY-MM-DD in the user's own timezone). Using local time
+// keeps a late-evening or early-morning session on the day it actually happened,
+// so the contribution graph and streaks line up with the user's calendar.
+function dateKey(d) {
+  const x = new Date(d);
+  const m = String(x.getMonth() + 1).padStart(2, "0");
+  const day = String(x.getDate()).padStart(2, "0");
+  return `${x.getFullYear()}-${m}-${day}`;
+}
+
+// FitBridge uses simple username + password. Supabase auth is email-based, so we
+// map a username to a stable synthetic email that never has to be seen or used.
+export function usernameToEmail(username) {
+  const slug = (username || "").trim().toLowerCase().replace(/[^a-z0-9_.]/g, "");
+  return `${slug}@fitbridge.app`;
+}
+
+/* ---------- defaults ---------- */
+
+const DEFAULT_PROFILE = {
+  name: "",
+  gender: "other",
+  height: 175,
+  weight: 70,
+  age: 24,
+  level: "beginner",
+  goal: "maintaining",
+  metricsPublic: false,
+  shareMetrics: true,
+  beastMode: true,
+  bio: "",
+  avatarHue: 22,
+  avatarUrl: null,
+  score: 0,
+  streak: 0,
+  joined: null,
+  onboarded: false,
+};
+
+/* ---------- row <-> app mappers ---------- */
+
+function rowToProfile(row) {
+  if (!row) return { ...DEFAULT_PROFILE };
+  return {
+    name: row.name ?? "",
+    gender: row.gender ?? "other",
+    height: Number(row.height ?? 175),
+    weight: Number(row.weight ?? 70),
+    age: Number(row.age ?? 24),
+    level: row.level ?? "beginner",
+    goal: row.goal ?? "maintaining",
+    metricsPublic: !!row.metrics_public,
+    shareMetrics: !!row.share_metrics,
+    beastMode: !!row.beast_mode,
+    bio: row.bio ?? "",
+    avatarHue: Number(row.avatar_hue ?? 22),
+    avatarUrl: row.avatar_url ?? null,
+    score: Number(row.score ?? 0),
+    streak: Number(row.streak ?? 0),
+    joined: row.joined ?? null,
+    onboarded: !!row.onboarded,
+  };
+}
+
+/** Convert a (partial) app-shape profile patch into DB column names. */
+function profileToRow(patch) {
+  const map = {
+    name: "name",
+    gender: "gender",
+    height: "height",
+    weight: "weight",
+    age: "age",
+    level: "level",
+    goal: "goal",
+    metricsPublic: "metrics_public",
+    shareMetrics: "share_metrics",
+    beastMode: "beast_mode",
+    bio: "bio",
+    avatarHue: "avatar_hue",
+    avatarUrl: "avatar_url",
+    score: "score",
+    streak: "streak",
+    joined: "joined",
+    onboarded: "onboarded",
+  };
+  const row = {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (k in map) row[map[k]] = v;
+  }
+  return row;
+}
+
+function rowToWorkout(row) {
+  const d = new Date(row.performed_at);
+  return {
+    id: row.id,
+    exerciseId: row.exercise_id,
+    date: d.toISOString(),
+    dateKey: dateKey(d),
+    reps: Number(row.reps ?? 0),
+    sets: Number(row.sets ?? 1),
+    durationSec: Number(row.duration_sec ?? 0),
+    formScore: Number(row.form_score ?? 0),
+    calories: Number(row.calories ?? 0),
+  };
+}
+
+function workoutToRow(w, userId) {
+  return {
+    user_id: userId,
+    exercise_id: w.exerciseId,
+    performed_at: w.date || new Date().toISOString(),
+    reps: Math.round(w.reps ?? 0),
+    sets: Math.round(w.sets ?? 1),
+    duration_sec: Math.round(w.durationSec ?? 0),
+    form_score: w.formScore ?? 0,
+    calories: w.calories ?? 0,
+  };
+}
+
+function rowToWeight(row) {
+  const d = new Date(row.logged_at);
+  return { date: d.toISOString(), dateKey: dateKey(d), weight: Number(row.weight) };
+}
+
+function rowToRun(row) {
+  const d = new Date(row.started_at);
+  return {
+    id: row.id,
+    date: d.toISOString(),
+    dateKey: dateKey(d),
+    durationSec: Number(row.duration_sec ?? 0),
+    distanceM: Number(row.distance_m ?? 0),
+    avgPaceSec: Number(row.avg_pace_sec ?? 0),
+    calories: Number(row.calories ?? 0),
+    path: Array.isArray(row.path) ? row.path : [],
+    note: row.note ?? "",
+  };
+}
+
+function rowToMeal(row) {
+  return {
+    id: row.id,
+    eatenOn: row.eaten_on, // 'YYYY-MM-DD'
+    slot: row.slot || "breakfast",
+    title: row.title || "",
+    photoUrl: row.photo_url || "",
+    items: Array.isArray(row.items) ? row.items : [],
+    kcal: Number(row.kcal ?? 0),
+    protein: Number(row.protein ?? 0),
+    carbs: Number(row.carbs ?? 0),
+    fat: Number(row.fat ?? 0),
+    ai: !!row.ai,
+  };
+}
+
+function mealToRow(m, userId) {
+  return {
+    user_id: userId,
+    eaten_on: m.eatenOn,
+    slot: m.slot || "breakfast",
+    title: m.title || "",
+    photo_url: m.photoUrl || "",
+    items: m.items ?? [],
+    kcal: m.kcal ?? 0,
+    protein: m.protein ?? 0,
+    carbs: m.carbs ?? 0,
+    fat: m.fat ?? 0,
+    ai: !!m.ai,
+  };
+}
+
+function runToRow(r, userId) {
+  return {
+    user_id: userId,
+    started_at: r.date || new Date().toISOString(),
+    duration_sec: Math.round(r.durationSec ?? 0),
+    distance_m: r.distanceM ?? 0,
+    avg_pace_sec: r.avgPaceSec ?? 0,
+    calories: r.calories ?? 0,
+    path: r.path ?? [],
+    note: r.note ?? "",
+  };
+}
+
+/* ---------- provider ---------- */
+
+export function AppStateProvider({ children }) {
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [dataLoading, setDataLoading] = useState(false);
+  const [profile, setProfile] = useState({ ...DEFAULT_PROFILE });
+  const [workouts, setWorkouts] = useState([]);
+  const [runs, setRuns] = useState([]);
+  const [meals, setMeals] = useState([]);
+  const [weightLog, setWeightLog] = useState([]);
+  const [lastCheckin, setLastCheckin] = useState(null);
+
+  const loadedUserId = useRef(null);
+
+  const userId = session?.user?.id ?? null;
+
+  const clearUserData = useCallback(() => {
+    loadedUserId.current = null;
+    setProfile({ ...DEFAULT_PROFILE });
+    setWorkouts([]);
+    setRuns([]);
+    setMeals([]);
+    setWeightLog([]);
+    setLastCheckin(null);
+  }, []);
+
+  const loadUserData = useCallback(async (uid) => {
+    setDataLoading(true);
+    try {
+      const [profRes, workRes, weightRes, runRes, mealRes] = await Promise.all([
+        supabase.from("profiles").select("*").eq("id", uid).maybeSingle(),
+        supabase
+          .from("workouts")
+          .select("*")
+          .eq("user_id", uid)
+          .order("performed_at", { ascending: false }),
+        supabase
+          .from("weight_logs")
+          .select("*")
+          .eq("user_id", uid)
+          .order("logged_at", { ascending: true }),
+        supabase
+          .from("runs")
+          .select("*")
+          .eq("user_id", uid)
+          .order("started_at", { ascending: false }),
+        supabase
+          .from("meals")
+          .select("*")
+          .eq("user_id", uid)
+          .order("eaten_on", { ascending: false })
+          .order("created_at", { ascending: true }),
+      ]);
+
+      if (profRes.data) {
+        setProfile(rowToProfile(profRes.data));
+        setLastCheckin(profRes.data.last_checkin ?? null);
+      }
+      setWorkouts((workRes.data || []).map(rowToWorkout));
+      setWeightLog((weightRes.data || []).map(rowToWeight));
+      setRuns((runRes.data || []).map(rowToRun));
+      setMeals((mealRes.data || []).map(rowToMeal));
+      loadedUserId.current = uid;
+    } catch {
+      /* network / RLS error — leave defaults; UI shows empty state */
+    } finally {
+      setDataLoading(false);
+    }
+  }, []);
+
+  // Resolve the session once, then react to auth changes.
+  useEffect(() => {
+    let active = true;
+
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        if (!active) return;
+        const sess = data.session ?? null;
+        setSession(sess);
+        if (sess?.user) loadUserData(sess.user.id);
+      })
+      .catch(() => {
+        /* offline / init failure — proceed as signed-out */
+      })
+      .finally(() => {
+        if (active) setAuthReady(true);
+      });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, sess) => {
+      if (!active) return;
+      setSession(sess ?? null);
+      const uid = sess?.user?.id ?? null;
+      if (!uid) {
+        clearUserData();
+      } else if (uid !== loadedUserId.current) {
+        loadUserData(uid);
+      }
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, [loadUserData, clearUserData]);
+
+  /* ---------- auth actions ---------- */
+
+  const signUp = useCallback(async (username, password) => {
+    try {
+      const email = usernameToEmail(username);
+      const name = username.trim();
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { data: { name, username: name } },
+      });
+      if (error) return { error: error.message };
+      // If the project has email confirmation off, a session is returned and we
+      // proceed. If not, try an immediate sign-in as a fallback.
+      if (data.session) return { error: null };
+      const { error: siErr } = await supabase.auth.signInWithPassword({ email, password });
+      if (siErr) return { error: null, needsConfirmation: true };
+      return { error: null };
+    } catch (e) {
+      return { error: e?.message || "network" };
+    }
+  }, []);
+
+  const signIn = useCallback(async (username, password) => {
+    try {
+      const email = usernameToEmail(username);
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) return { error: error.message };
+      let onboarded = false;
+      try {
+        const { data: prof } = await supabase
+          .from("profiles")
+          .select("onboarded")
+          .eq("id", data.user.id)
+          .maybeSingle();
+        onboarded = !!prof?.onboarded;
+      } catch {
+        /* profile read failed — treat as not onboarded, page will recover */
+      }
+      return { error: null, onboarded };
+    } catch (e) {
+      return { error: e?.message || "network" };
+    }
+  }, []);
+
+  const signOut = useCallback(async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch {
+      /* ignore */
+    }
+    clearUserData();
+  }, [clearUserData]);
+
+  /* ---------- profile / data actions ---------- */
+
+  const completeOnboarding = useCallback(
+    async (data) => {
+      const uid = session?.user?.id;
+      const joined = profile.joined || new Date().toISOString();
+      const nextProfile = { ...profile, ...data, joined, onboarded: true };
+
+      // Optimistic local update so the UI advances immediately.
+      setProfile(nextProfile);
+      setLastCheckin(new Date().toISOString());
+
+      if (!uid) return;
+
+      // Record the starting weight as the first real data point, nothing fake.
+      await supabase
+        .from("profiles")
+        .update({ ...profileToRow({ ...data, joined, onboarded: true }), last_checkin: new Date().toISOString() })
+        .eq("id", uid);
+
+      if (nextProfile.weight) {
+        const { count } = await supabase
+          .from("weight_logs")
+          .select("id", { count: "exact", head: true })
+          .eq("user_id", uid);
+        if (!count) {
+          await supabase
+            .from("weight_logs")
+            .insert({ user_id: uid, logged_at: joined, weight: nextProfile.weight });
+        }
+      }
+
+      await loadUserData(uid);
+    },
+    [session, profile, loadUserData]
+  );
+
+  const updateProfile = useCallback(
+    async (patch) => {
+      setProfile((p) => ({ ...p, ...patch }));
+      const uid = session?.user?.id;
+      if (!uid) return;
+      await supabase.from("profiles").update(profileToRow(patch)).eq("id", uid);
+    },
+    [session]
+  );
+
+  const uploadAvatar = useCallback(
+    async (file) => {
+      const uid = session?.user?.id;
+      if (!uid || !file) return { error: "not-signed-in" };
+      try {
+        const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+        const path = `${uid}/avatar-${Date.now()}.${ext}`;
+        const { error: upErr } = await supabase.storage
+          .from("avatars")
+          .upload(path, file, { upsert: true, contentType: file.type || "image/jpeg" });
+        if (upErr) return { error: upErr.message };
+        const { data } = supabase.storage.from("avatars").getPublicUrl(path);
+        const url = data?.publicUrl ?? null;
+        if (url) {
+          setProfile((p) => ({ ...p, avatarUrl: url }));
+          await supabase.from("profiles").update({ avatar_url: url }).eq("id", uid);
+        }
+        return { error: null, url };
+      } catch (e) {
+        return { error: e?.message || "upload-failed" };
+      }
+    },
+    [session]
+  );
+
+  const addWorkout = useCallback(
+    async (entry) => {
+      const uid = session?.user?.id;
+      const now = new Date();
+      const optimistic = {
+        id: `w-${Date.now()}`,
+        date: now.toISOString(),
+        dateKey: dateKey(now),
+        ...entry,
+      };
+      setWorkouts((prev) => [optimistic, ...prev]);
+      if (!uid) return;
+      const { data } = await supabase
+        .from("workouts")
+        .insert(workoutToRow({ ...entry, date: optimistic.date }, uid))
+        .select()
+        .maybeSingle();
+      if (data) {
+        // Replace the optimistic row with the persisted one (real id).
+        setWorkouts((prev) => [rowToWorkout(data), ...prev.filter((w) => w.id !== optimistic.id)]);
+      }
+    },
+    [session]
+  );
+
+  const addRun = useCallback(
+    async (entry) => {
+      const uid = session?.user?.id;
+      const now = new Date();
+      const date = entry.date || now.toISOString();
+      const optimistic = {
+        id: `r-${Date.now()}`,
+        date,
+        dateKey: dateKey(new Date(date)),
+        durationSec: entry.durationSec ?? 0,
+        distanceM: entry.distanceM ?? 0,
+        avgPaceSec: entry.avgPaceSec ?? 0,
+        calories: entry.calories ?? 0,
+        path: entry.path ?? [],
+        note: entry.note ?? "",
+      };
+      setRuns((prev) => [optimistic, ...prev]);
+      if (!uid) return optimistic;
+      const { data } = await supabase
+        .from("runs")
+        .insert(runToRow({ ...entry, date }, uid))
+        .select()
+        .maybeSingle();
+      if (data) {
+        const saved = rowToRun(data);
+        setRuns((prev) => [saved, ...prev.filter((r) => r.id !== optimistic.id)]);
+        return saved;
+      }
+      return optimistic;
+    },
+    [session]
+  );
+
+  const addMeal = useCallback(
+    async (entry) => {
+      const uid = session?.user?.id;
+      const optimistic = { id: `m-${Date.now()}`, items: [], kcal: 0, protein: 0, carbs: 0, fat: 0, ai: false, photoUrl: "", title: "", ...entry };
+      setMeals((prev) => [optimistic, ...prev]);
+      if (!uid) return optimistic;
+      const { data } = await supabase.from("meals").insert(mealToRow(entry, uid)).select().maybeSingle();
+      if (data) {
+        const saved = rowToMeal(data);
+        setMeals((prev) => [saved, ...prev.filter((m) => m.id !== optimistic.id)]);
+        return saved;
+      }
+      return optimistic;
+    },
+    [session]
+  );
+
+  const deleteMeal = useCallback(
+    async (id) => {
+      setMeals((prev) => prev.filter((m) => m.id !== id));
+      const uid = session?.user?.id;
+      if (!uid) return;
+      await supabase.from("meals").delete().eq("id", id).eq("user_id", uid);
+    },
+    [session]
+  );
+
+  const uploadMealPhoto = useCallback(
+    async (file) => {
+      const uid = session?.user?.id;
+      if (!uid || !file) return { error: "not-signed-in" };
+      try {
+        const ext = (file.name?.split(".").pop() || "jpg").toLowerCase();
+        const path = `${uid}/meal-${Date.now()}.${ext}`;
+        const { error: upErr } = await supabase.storage
+          .from("meal-photos")
+          .upload(path, file, { upsert: true, contentType: file.type || "image/jpeg" });
+        if (upErr) return { error: upErr.message };
+        const { data } = supabase.storage.from("meal-photos").getPublicUrl(path);
+        return { url: data?.publicUrl ?? null };
+      } catch (e) {
+        return { error: e?.message || "upload-failed" };
+      }
+    },
+    [session]
+  );
+
+  const updateWeight = useCallback(
+    async (weight) => {
+      const uid = session?.user?.id;
+      const now = new Date();
+      setProfile((p) => ({ ...p, weight }));
+      setWeightLog((prev) => [
+        ...prev,
+        { date: now.toISOString(), dateKey: dateKey(now), weight },
+      ]);
+      setLastCheckin(now.toISOString());
+      if (!uid) return;
+      await Promise.all([
+        supabase.from("profiles").update({ weight, last_checkin: now.toISOString() }).eq("id", uid),
+        supabase.from("weight_logs").insert({ user_id: uid, logged_at: now.toISOString(), weight }),
+      ]);
+    },
+    [session]
+  );
+
+  const dismissCheckin = useCallback(async () => {
+    const uid = session?.user?.id;
+    const now = new Date().toISOString();
+    setLastCheckin(now);
+    if (!uid) return;
+    await supabase.from("profiles").update({ last_checkin: now }).eq("id", uid);
+  }, [session]);
+
+  const resetAll = useCallback(async () => {
+    const uid = session?.user?.id;
+    if (uid) {
+      await Promise.all([
+        supabase.from("workouts").delete().eq("user_id", uid),
+        supabase.from("weight_logs").delete().eq("user_id", uid),
+        supabase.from("runs").delete().eq("user_id", uid),
+        supabase.from("meals").delete().eq("user_id", uid),
+        supabase
+          .from("profiles")
+          .update({ onboarded: false, last_checkin: null })
+          .eq("id", uid),
+      ]);
+    }
+    setWorkouts([]);
+    setRuns([]);
+    setMeals([]);
+    setWeightLog([]);
+    setLastCheckin(null);
+    setProfile((p) => ({ ...p, onboarded: false }));
+  }, [session]);
+
+  const auth = useMemo(
+    () => ({
+      signedIn: !!session,
+      email: session?.user?.email ?? null,
+      userId,
+    }),
+    [session, userId]
+  );
+
+  const value = useMemo(
+    () => ({
+      auth,
+      authReady,
+      dataLoading,
+      profile,
+      workouts,
+      runs,
+      meals,
+      weightLog,
+      lastCheckin,
+      signUp,
+      signIn,
+      signOut,
+      completeOnboarding,
+      updateProfile,
+      uploadAvatar,
+      addWorkout,
+      addRun,
+      addMeal,
+      deleteMeal,
+      uploadMealPhoto,
+      updateWeight,
+      dismissCheckin,
+      resetAll,
+    }),
+    [
+      auth,
+      authReady,
+      dataLoading,
+      profile,
+      workouts,
+      runs,
+      meals,
+      weightLog,
+      lastCheckin,
+      signUp,
+      signIn,
+      signOut,
+      completeOnboarding,
+      updateProfile,
+      uploadAvatar,
+      addWorkout,
+      addRun,
+      addMeal,
+      deleteMeal,
+      uploadMealPhoto,
+      updateWeight,
+      dismissCheckin,
+      resetAll,
+    ]
+  );
+
+  return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+}
+
+export function useApp() {
+  const ctx = useContext(AppContext);
+  if (!ctx) throw new Error("useApp must be used within AppStateProvider");
+  return ctx;
+}
+
+/* ---------- derived selectors ---------- */
+
+export function useStats() {
+  const { workouts, weightLog } = useApp();
+
+  return useMemo(() => {
+    const now = new Date();
+    const key = dateKey; // local calendar day, matches workout.dateKey
+
+    const contribution = {};
+    for (const w of workouts) contribution[w.dateKey] = (contribution[w.dateKey] || 0) + 1;
+
+    let streak = 0;
+    for (let i = 0; i < 400; i++) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      if (contribution[key(d)]) streak++;
+      else if (i === 0) continue;
+      else break;
+    }
+
+    const cutoff7 = new Date(now); cutoff7.setDate(now.getDate() - 7);
+    const cutoff30 = new Date(now); cutoff30.setDate(now.getDate() - 30);
+    const last7 = workouts.filter((w) => new Date(w.date) >= cutoff7);
+    const last30 = workouts.filter((w) => new Date(w.date) >= cutoff30);
+
+    const sum = (arr, f) => arr.reduce((a, w) => a + f(w), 0);
+    const weekVolume = sum(last7, (w) => w.reps * (w.sets || 1) || w.durationSec / 6);
+    const weekCalories = sum(last7, (w) => w.calories);
+    const totalWorkouts = workouts.length;
+    const avgForm = workouts.length
+      ? +(sum(workouts.slice(0, 30), (w) => w.formScore) / Math.min(30, workouts.length)).toFixed(1)
+      : 0;
+
+    const muscleVolume = {};
+    for (const w of last30) {
+      const ex = getExercise(w.exerciseId);
+      const v = (w.reps || w.durationSec / 6) * 1;
+      for (const m of ex.targets) muscleVolume[m] = (muscleVolume[m] || 0) + v;
+    }
+    const maxMuscle = Math.max(1, ...Object.values(muscleVolume));
+
+    const weeklySeries = [];
+    for (let wk = 11; wk >= 0; wk--) {
+      const start = new Date(now); start.setDate(now.getDate() - wk * 7 - 6);
+      const end = new Date(now); end.setDate(now.getDate() - wk * 7);
+      const inWeek = workouts.filter((w) => {
+        const d = new Date(w.date);
+        return d >= start && d <= end;
+      });
+      weeklySeries.push({
+        label: `${end.getMonth() + 1}/${end.getDate()}`,
+        volume: Math.round(sum(inWeek, (w) => w.reps * (w.sets || 1) || w.durationSec / 6)),
+        calories: Math.round(sum(inWeek, (w) => w.calories)),
+      });
+    }
+
+    const activeDays = new Set(last30.map((w) => w.dateKey)).size;
+    const consistency = Math.min(100, Math.round((activeDays / 30) * 100));
+    const intensity = Math.min(100, Math.round((weekVolume / 900) * 100));
+
+    return {
+      contribution,
+      streak,
+      weekVolume: Math.round(weekVolume),
+      weekCalories: Math.round(weekCalories),
+      totalWorkouts,
+      avgForm,
+      muscleVolume,
+      maxMuscle,
+      weeklySeries,
+      weightSeries: weightLog,
+      consistency,
+      intensity,
+      last7,
+      recent: workouts.slice(0, 8),
+    };
+  }, [workouts, weightLog]);
+}
